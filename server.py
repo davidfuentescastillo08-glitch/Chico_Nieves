@@ -2,6 +2,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -11,6 +12,7 @@ from aiohttp import web
 import av
 import edge_tts
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -37,6 +39,15 @@ active_chico_ws = None
 main_loop = None
 active_timers = {}
 timer_counter = 0
+mcp_call_seq = 100
+pending_mcp_calls = {}
+preview_param_name = "url"
+public_base_url = "https://chico-nieves.onrender.com"
+current_timer_jpeg = b""
+
+_FONT_BIG = None
+_FONT_SMALL = None
+_FONT_TINY = None
 
 _NUM_WORDS = {
     "un": 1, "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6,
@@ -45,6 +56,135 @@ _NUM_WORDS = {
     "dieciocho": 18, "diecinueve": 19, "veinte": 20, "veinticinco": 25, "treinta": 30,
     "cuarenta": 40, "cuarenta y cinco": 45, "cincuenta": 50, "sesenta": 60, "noventa": 90,
 }
+
+
+def _load_fonts():
+    global _FONT_BIG, _FONT_SMALL, _FONT_TINY
+    if _FONT_BIG is not None:
+        return
+    for fpath in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\seguisb.ttf",
+    ]:
+        if os.path.exists(fpath):
+            _FONT_BIG = ImageFont.truetype(fpath, 108)
+            _FONT_SMALL = ImageFont.truetype(fpath, 38)
+            _FONT_TINY = ImageFont.truetype(fpath, 26)
+            return
+    _FONT_BIG = ImageFont.load_default()
+    _FONT_SMALL = ImageFont.load_default()
+    _FONT_TINY = ImageFont.load_default()
+
+
+def render_timer_frame_jpeg(remaining_sec: int, total_sec: int, label: str) -> bytes:
+    """Renders a crisp 240x240 supersampled circular timer with smooth ring & rounded caps."""
+    _load_fonts()
+    S = 480  # 2x supersampling for buttery smooth anti-aliased edges
+    img = Image.new("RGB", (S, S), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    elapsed = max(0, total_sec - remaining_sec)
+    progress = min(1.0, elapsed / max(1, total_sec))
+
+    # Accent color: vibrant cyan normally, warm coral in final 10s
+    urgent = (total_sec >= 15 and remaining_sec <= 10) or remaining_sec == 0
+    accent = (255, 92, 96) if urgent else (0, 212, 255)
+    track = (24, 38, 56)
+
+    margin = 30
+    ring_w = 30
+    box = [margin, margin, S - margin, S - margin]
+    cx, cy = S / 2.0, S / 2.0
+    radius = (S / 2.0) - margin - (ring_w / 2.0)
+
+    # Background ring track
+    draw.arc(box, start=0, end=360, fill=track, width=ring_w)
+
+    # Progress arc filling clockwise from 12 o'clock (-90 deg)
+    if progress > 0.002:
+        end_deg = -90.0 + (360.0 * progress)
+        draw.arc(box, start=-90, end=end_deg, fill=accent, width=ring_w)
+
+        # Smooth rounded end-caps at start (-90 deg) and leading edge (end_deg)
+        cap_r = ring_w / 2.0
+        for deg in (-90.0, end_deg):
+            rad = math.radians(deg)
+            px = cx + radius * math.cos(rad)
+            py = cy + radius * math.sin(rad)
+            draw.ellipse([px - cap_r, py - cap_r, px + cap_r, py + cap_r], fill=accent)
+
+        # Subtle bright highlight dot on the leading tip
+        rad = math.radians(end_deg)
+        px = cx + radius * math.cos(rad)
+        py = cy + radius * math.sin(rad)
+        dot_r = cap_r * 0.45
+        draw.ellipse([px - dot_r, py - dot_r, px + dot_r, py + dot_r], fill=(235, 252, 255))
+
+    # Top subtle status label
+    top_txt = "¡LISTO!" if remaining_sec == 0 else "FALTAN"
+    tb = draw.textbbox((0, 0), top_txt, font=_FONT_TINY)
+    draw.text(((S - (tb[2] - tb[0])) / 2, 118), top_txt, fill=(130, 155, 180), font=_FONT_TINY)
+
+    # Big center countdown MM:SS or H:MM:SS
+    h, rem = divmod(max(0, int(remaining_sec)), 3600)
+    m, s = divmod(rem, 60)
+    time_str = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+    bb = draw.textbbox((0, 0), time_str, font=_FONT_BIG)
+    tw, th = bb[2] - bb[0], bb[3] - bb[1]
+    draw.text(((S - tw) / 2, (S - th) / 2 - 22), time_str, fill=(255, 255, 255), font=_FONT_BIG)
+
+    # Bottom timer label
+    clean_lbl = label.strip().upper()[:14] if label and label.lower() not in ("temporizador", "timer", "") else "TEMPORIZADOR"
+    lb = draw.textbbox((0, 0), clean_lbl, font=_FONT_SMALL)
+    draw.text(((S - (lb[2] - lb[0])) / 2, 314), clean_lbl, fill=accent, font=_FONT_SMALL)
+
+    final_img = img.resize((240, 240), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    final_img.save(buf, format="JPEG", quality=82, optimize=True)
+    return buf.getvalue()
+
+
+def next_mcp_id() -> int:
+    global mcp_call_seq
+    mcp_call_seq += 1
+    return mcp_call_seq
+
+
+async def send_mcp_to_chico(tool_name: str, arguments: dict, wait_response: bool = False, timeout: float = 2.5):
+    global active_chico_ws
+    if not active_chico_ws or active_chico_ws.closed:
+        return None
+    call_id = next_mcp_id()
+    fut = None
+    if wait_response:
+        fut = asyncio.get_running_loop().create_future()
+        pending_mcp_calls[call_id] = fut
+
+    mcp_msg = {
+        "type": "mcp",
+        "payload": {
+            "jsonrpc": "2.0",
+            "id": call_id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments,
+            },
+        },
+    }
+    try:
+        await active_chico_ws.send_str(json.dumps(mcp_msg))
+        logger.info(f"Sent MCP: {tool_name}({arguments}) [id={call_id}]")
+        if fut is not None:
+            return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning(f"MCP timeout for {tool_name} [id={call_id}]")
+    except Exception as e:
+        logger.warning(f"Failed MCP {tool_name}: {e}")
+    finally:
+        pending_mcp_calls.pop(call_id, None)
+    return None
 
 
 def parse_spanish_duration(text: str):
@@ -88,16 +228,6 @@ def _fmt_duration(sec: int) -> str:
     if s or not parts:
         parts.append("1 segundo" if s == 1 else f"{s} segundos")
     return " y ".join(parts)
-
-
-async def send_json_to_chico(payload: dict):
-    global active_chico_ws
-    if not active_chico_ws or active_chico_ws.closed:
-        return
-    try:
-        await active_chico_ws.send_str(json.dumps(payload))
-    except Exception as e:
-        logger.warning(f"Failed sending JSON to Chico: {e}")
 
 
 def generate_alarm_beep_opus_packets(duration_sec: float = 2.0):
@@ -196,6 +326,9 @@ async def notify_chico(text: str, with_beep: bool = False):
         await active_chico_ws.send_str(json.dumps({"type": "tts", "state": "sentence_end"}))
         await active_chico_ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
         logger.info(f"Notification played: '{text}'")
+        if not active_timers:
+            await asyncio.sleep(0.25)
+            await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
     except Exception as e:
         logger.error(f"Error streaming notification: {e}")
 
@@ -207,20 +340,47 @@ def add_timer(duration_seconds: int, label: str) -> int:
     end_time = time.time() + duration_seconds
 
     async def timer_worker():
+        global current_timer_jpeg
         try:
-            # Tell our custom firmware to show the native LVGL animated blue-ring timer!
-            await send_json_to_chico({"type": "timer", "action": "start", "seconds": duration_seconds, "label": label})
-            await asyncio.sleep(duration_seconds)
+            # Small initial delay so the confirmation TTS starts smoothly first
+            await asyncio.sleep(0.25)
+            last_shown = -1
+            while True:
+                now = time.time()
+                rem_float = end_time - now
+                rem_int = max(0, int(math.ceil(rem_float)))
+
+                if rem_int != last_shown:
+                    last_shown = rem_int
+                    current_timer_jpeg = render_timer_frame_jpeg(rem_int, duration_seconds, label)
+                    img_url = f"{public_base_url}/timer.jpg?id={t_id}&r={rem_int}&ts={int(now * 1000)}"
+                    await send_mcp_to_chico(
+                        "self.screen.preview_image",
+                        {preview_param_name: img_url},
+                        wait_response=True,
+                        timeout=2.5,
+                    )
+
+                if rem_float <= 0:
+                    break
+
+                # Sleep until the next whole-second tick
+                next_boundary = end_time - (rem_int - 1)
+                sleep_dur = max(0.05, min(1.0, next_boundary - time.time()))
+                await asyncio.sleep(sleep_dur)
+
             if t_id in active_timers:
                 del active_timers[t_id]
+
             logger.info(f"Timer #{t_id} ('{label}') expired -> returning to eyes + 2s beep + voice")
-            await send_json_to_chico({"type": "timer", "action": "stop"})
+            await asyncio.sleep(0.25)
+            await send_mcp_to_chico("self.screen.clear_preview", {}, wait_response=True, timeout=1.5)
             await asyncio.sleep(0.15)
             para = "" if label.lower() in ("temporizador", "timer", "") else f" de {label}"
             await notify_chico(f"¡Nieves! Se ha acabado el temporizador{para}.", with_beep=True)
         except asyncio.CancelledError:
-            await send_json_to_chico({"type": "timer", "action": "stop"})
-            logger.info(f"Timer #{t_id} cancelled.")
+            logger.info(f"Timer #{t_id} cancelled -> clearing preview.")
+            await send_mcp_to_chico("self.screen.clear_preview", {}, wait_response=False)
 
     future = asyncio.run_coroutine_threadsafe(timer_worker(), main_loop)
     active_timers[t_id] = {"label": label, "duration": duration_seconds, "end_time": end_time, "task": future}
@@ -281,7 +441,7 @@ def transcribe_audio_groq(wav_bytes: bytes) -> str:
     data = {
         "model": GROQ_STT_MODEL,
         "language": "es",
-        "prompt": "Chico, temporizador, alarma, recordatorio, minutos, segundos, pizza, Nieves."
+        "prompt": "Chico, temporizador, alarma, recordatorio, minutos, segundos, pizza, Nieves.",
     }
     try:
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=8)
@@ -307,7 +467,7 @@ def query_groq_llm(user_text: str) -> str:
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
-        "User-Agent": "ChicoClient/1.0"
+        "User-Agent": "ChicoClient/1.0",
     }
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history[-6:] + [{"role": "user", "content": user_text}]
     data = {"model": GROQ_LLM_MODEL, "messages": messages, "max_tokens": 120, "temperature": 0.7}
@@ -329,34 +489,63 @@ def query_groq_llm(user_text: str) -> str:
 
 
 async def handle_ota(request):
+    global public_base_url
     host = request.headers.get("Host", f"localhost:{PORT}")
     proto = request.headers.get("X-Forwarded-Proto", "http")
+    public_base_url = f"{proto}://{host}"
     ws_scheme = "wss" if proto == "https" else "ws"
     return web.json_response({
         "websocket": {"url": f"{ws_scheme}://{host}/ws"},
-        "theme": "dark"
+        "theme": "dark",
     })
+
+
+async def handle_timer_image(request):
+    global current_timer_jpeg
+    if not current_timer_jpeg:
+        current_timer_jpeg = render_timer_frame_jpeg(0, 1, "TEMPORIZADOR")
+    return web.Response(
+        body=current_timer_jpeg,
+        content_type="image/jpeg",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 async def handle_root(request):
     return web.Response(
-        text="<h1>Chico Cloud Server 24/7 activo para Nieves! ❤️</h1><p>Groq Whisper + Qwen + Edge-TTS Álvaro + Temporizadores.</p>",
-        content_type="text/html"
+        text="<h1>Chico Cloud Server 24/7 activo para Nieves!</h1><p>Troko Visual Timers + Groq Whisper + Qwen + Edge-TTS Alvaro.</p>",
+        content_type="text/html",
     )
 
 
 async def handle_websocket(request):
-    global active_chico_ws, main_loop
+    global active_chico_ws, main_loop, public_base_url, preview_param_name
     main_loop = asyncio.get_running_loop()
+    host = request.headers.get("Host", "")
+    proto = request.headers.get("X-Forwarded-Proto", "https" if "onrender.com" in host else "http")
+    if host:
+        public_base_url = f"{proto}://{host}"
+
     ws = web.WebSocketResponse(heartbeat=25.0)
     await ws.prepare(request)
     active_chico_ws = ws
-    logger.info(f"Chico WebSocket connected from {request.remote}!")
+    logger.info(f"Chico WebSocket connected from {request.remote}! Base URL: {public_base_url}")
 
     await ws.send_str(json.dumps({
         "type": "hello",
         "transport": "websocket",
-        "audio_params": {"format": "opus", "sample_rate": 16000, "channels": 1, "frame_duration": 60}
+        "audio_params": {"format": "opus", "sample_rate": 16000, "channels": 1, "frame_duration": 60},
+    }))
+
+    # Query MCP tools (including user tools) to auto-confirm preview_image parameter name
+    await ws.send_str(json.dumps({
+        "type": "mcp",
+        "payload": {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {"withUserTools": True},
+        },
     }))
 
     decoder = av.CodecContext.create("opus", "r")
@@ -409,6 +598,9 @@ async def handle_websocket(request):
             await ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
             is_processing = False
             total_listen_frames = speech_frames_count = silence_frames_after_speech = 0
+            if not active_timers:
+                await asyncio.sleep(0.15)
+                await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
             return
 
         reply_text = await loop.run_in_executor(None, query_groq_llm, user_text)
@@ -428,6 +620,9 @@ async def handle_websocket(request):
                 await asyncio.sleep(0.055)
             await ws.send_str(json.dumps({"type": "tts", "state": "sentence_end"}))
             await ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
+            if not active_timers:
+                await asyncio.sleep(0.2)
+                await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
         except Exception as e:
             logger.warning(f"TTS stream error: {e}")
         finally:
@@ -441,6 +636,21 @@ async def handle_websocket(request):
                 data = json.loads(msg.data)
                 msg_type = data.get("type")
                 state = data.get("state")
+
+                if msg_type == "mcp":
+                    payload = data.get("payload", {})
+                    resp_id = payload.get("id")
+                    if resp_id in pending_mcp_calls and not pending_mcp_calls[resp_id].done():
+                        pending_mcp_calls[resp_id].set_result(payload)
+                    elif resp_id == 1 and "result" in payload:
+                        for t in payload["result"].get("tools", []):
+                            if t.get("name") == "self.screen.preview_image":
+                                props = list(t.get("inputSchema", {}).get("properties", {}).keys())
+                                if props:
+                                    preview_param_name = props[0]
+                                    logger.info(f"Confirmed preview_image param: '{preview_param_name}'")
+                    continue
+
                 logger.info(f"Chico event: {data}")
                 if msg_type == "listen" and state == "start":
                     if is_processing or is_playing_tts:
@@ -489,8 +699,11 @@ async def handle_websocket(request):
 def main():
     app = web.Application()
     app.router.add_get("/", handle_root)
+    app.router.add_get("/o", handle_ota)
+    app.router.add_post("/o", handle_ota)
     app.router.add_get("/ota/", handle_ota)
     app.router.add_post("/ota/", handle_ota)
+    app.router.add_get("/timer.jpg", handle_timer_image)
     app.router.add_get("/ws", handle_websocket)
     logger.info(f"CHICO CLOUD SERVER 24/7 INICIADO EN 0.0.0.0:{PORT}")
     web.run_app(app, host="0.0.0.0", port=PORT)
