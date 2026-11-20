@@ -31,7 +31,8 @@ jobs:
           rm -f sdkconfig
           idf.py reconfigure
           idf.py build
-          esptool.py --chip esp32s3 merge_bin -o ../chico-nieves-merged.bin --flash_mode dio --flash_size 16MB @build/flash_args
+                   cd build
+          esptool.py --chip esp32s3 merge-bin -o ../../chico-nieves-merged.bin --flash-mode dio --flash-size 16MB @flash_args
       - name: Upload Chico Firmware Artifact
         uses: actions/upload-artifact@v4
         with:
