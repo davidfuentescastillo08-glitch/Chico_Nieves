@@ -45,7 +45,6 @@ def patch_application_cc():
     # 1. Anti-cutoff: NEVER keep wake word detection enabled while speaking (prevents speaker->mic echo abort!)
     old_speaking = "audio_service_.EnableWakeWordDetection(audio_service_.IsAfeWakeWord());"
     if old_speaking in src:
-        # Replace ONLY inside kDeviceStateSpeaking (first occurrence after kDeviceStateSpeaking)
         idx_spk = src.find("case kDeviceStateSpeaking:")
         if idx_spk != -1:
             idx_call = src.find(old_speaking, idx_spk)
@@ -62,10 +61,66 @@ def patch_application_cc():
             src = src[:idx_listen] + "SetDeviceState(kDeviceStateIdle); // Chico Alexa Mode" + src[idx_listen + len(old_tts_stop):]
             print("[OK] Alexa Mode enabled on tts: stop -> kDeviceStateIdle")
 
-    # 3. Native LVGL Animated Blue-Ring Timer overlay triggered by JSON {"type":"timer","action":"start"|"stop",...}
-    timer_helper = r'''
-// --- CHICO NATIVE LVGL ANIMATED BLUE-RING TIMER ---
+    # 3. Native LVGL Animated Blue Eyes (Solo Ojos) + Animated Blue-Ring Timer
+    chico_ui_code = r'''
+// --- CHICO NATIVE LVGL ANIMATED EYES + BLUE-RING TIMER ---
 #include <lvgl.h>
+
+static lv_obj_t* g_chico_eyes_bg = nullptr;
+static lv_obj_t* g_chico_eye_l = nullptr;
+static lv_obj_t* g_chico_eye_r = nullptr;
+static lv_timer_t* g_chico_eyes_timer = nullptr;
+static int g_chico_eye_tick = 0;
+
+static void ChicoEyesTick(lv_timer_t* t) {
+    (void)t;
+    if (!g_chico_eye_l || !g_chico_eye_r) return;
+    g_chico_eye_tick++;
+    int phase = g_chico_eye_tick % 45; // ~4.5s cycle at 100ms tick
+
+    // Natural blink
+    if (phase == 40 || phase == 41) {
+        lv_obj_set_height(g_chico_eye_l, 10);
+        lv_obj_set_height(g_chico_eye_r, 10);
+    } else {
+        lv_obj_set_height(g_chico_eye_l, 76);
+        lv_obj_set_height(g_chico_eye_r, 76);
+    }
+
+    // Subtle lively look left / center / right
+    int dx = 0;
+    if (phase >= 12 && phase <= 20) dx = -8;
+    else if (phase >= 26 && phase <= 34) dx = 8;
+    lv_obj_align(g_chico_eye_l, LV_ALIGN_CENTER, -42 + dx, 0);
+    lv_obj_align(g_chico_eye_r, LV_ALIGN_CENTER,  42 + dx, 0);
+}
+
+static void ChicoEyesInit() {
+    if (g_chico_eyes_bg) return;
+    g_chico_eyes_bg = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(g_chico_eyes_bg, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(g_chico_eyes_bg, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(g_chico_eyes_bg, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(g_chico_eyes_bg, 0, 0);
+    lv_obj_set_style_pad_all(g_chico_eyes_bg, 0, 0);
+    lv_obj_clear_flag(g_chico_eyes_bg, LV_OBJ_FLAG_SCROLLABLE);
+
+    auto make_eye = [&](int x_off) -> lv_obj_t* {
+        lv_obj_t* eye = lv_obj_create(g_chico_eyes_bg);
+        lv_obj_set_size(eye, 64, 76);
+        lv_obj_set_style_radius(eye, 32, 0);
+        lv_obj_set_style_bg_color(eye, lv_color_hex(0x00D8FF), 0);
+        lv_obj_set_style_bg_opa(eye, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(eye, 0, 0);
+        lv_obj_clear_flag(eye, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(eye, LV_ALIGN_CENTER, x_off, 0);
+        return eye;
+    };
+    g_chico_eye_l = make_eye(-42);
+    g_chico_eye_r = make_eye(42);
+    g_chico_eyes_timer = lv_timer_create(ChicoEyesTick, 100, nullptr);
+}
+
 static lv_obj_t* g_chico_timer_bg = nullptr;
 static lv_obj_t* g_chico_timer_arc = nullptr;
 static lv_obj_t* g_chico_timer_time_lbl = nullptr;
@@ -143,12 +198,21 @@ static void ChicoTimerShow(int seconds, const char* label) {
 
     g_chico_lv_timer = lv_timer_create(ChicoTimerTick, 1000, nullptr);
 }
-// --- END CHICO TIMER ---
+// --- END CHICO UI ---
 '''
-    # Insert helper right after #define TAG "Application"
     tag_anchor = '#define TAG "Application"'
     if tag_anchor in src and "ChicoTimerShow" not in src:
-        src = src.replace(tag_anchor, tag_anchor + "\n" + timer_helper, 1)
+        src = src.replace(tag_anchor, tag_anchor + "\n" + chico_ui_code, 1)
+
+    # Show Chico animated blue eyes once WiFi is connected & device enters Idle (so WiFi setup screen still works!)
+    idle_anchor = "case kDeviceStateIdle:"
+    if idle_anchor in src and "ChicoEyesInit()" not in src:
+        src = src.replace(
+            idle_anchor,
+            idle_anchor + "\n            { DisplayLockGuard lock(display); ChicoEyesInit(); }",
+            1,
+        )
+        print("[OK] Injected ChicoEyesInit() on kDeviceStateIdle (Solo Ojos!)")
 
     # Handle {"type":"timer","action":"start"|"stop",...} inside OnIncomingJson
     tts_anchor = 'if (strcmp(type->valuestring, "tts") == 0)'
@@ -178,36 +242,6 @@ static void ChicoTimerShow(int seconds, const char* label) {
         f.write(src)
 
 
-def patch_lcd_display():
-    """Hide status bar and chat subtitles cleanly so ONLY animated eyes appear on pure black."""
-    path = os.path.join(REPO, "main", "display", "lcd_display.cc")
-    if not os.path.exists(path):
-        print("[WARN] lcd_display.cc not found, skipping UI patch")
-        return
-    with open(path, "r", encoding="utf-8") as f:
-        src = f.read()
-
-    # Make SetStatus, SetChatMessage, UpdateStatusBar no-ops so no ugly bars or text ever show
-    for fn_sig in [
-        "void LcdDisplay::SetStatus(const char* status) {",
-        "void LcdDisplay::SetChatMessage(const char* role, const char* content) {",
-    ]:
-        if fn_sig in src:
-            src = src.replace(fn_sig, fn_sig + "\n    return; // Chico Solo Ojos\n", 1)
-
-    # Hide status_bar_ right after it is created
-    if "status_bar_ = lv_obj_create" in src:
-        src = src.replace(
-            "lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);",
-            "lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);\n    lv_obj_add_flag(status_bar_, LV_OBJ_FLAG_HIDDEN);",
-            1,
-        )
-
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(src)
-    print("[OK] Patched lcd_display.cc for Solo Ojos clean UI")
-
-
 def write_sdkconfig_defaults():
     path = os.path.join(REPO, "sdkconfig.defaults.chico")
     cfg = f'''
@@ -226,9 +260,9 @@ CONFIG_USE_AUDIO_PROCESSOR=y
 CONFIG_USE_CUSTOM_WAKE_WORD=y
 CONFIG_SR_MN_CN_NONE=y
 CONFIG_SR_MN_EN_MULTINET7_QUANT=y
-CONFIG_CUSTOM_WAKE_WORD="CHEE KOW"
+CONFIG_CUSTOM_WAKE_WORD="chico"
 CONFIG_CUSTOM_WAKE_WORD_DISPLAY="Chico"
-CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=20
+CONFIG_CUSTOM_WAKE_WORD_THRESHOLD=10
 CONFIG_WAKE_WORD_DETECTION_IN_LISTENING=n
 CONFIG_LV_FONT_MONTSERRAT_28=y
 '''
@@ -240,6 +274,5 @@ CONFIG_LV_FONT_MONTSERRAT_28=y
 if __name__ == "__main__":
     patch_board_pins()
     patch_application_cc()
-    patch_lcd_display()
     write_sdkconfig_defaults()
     print("=== ALL CHICO C++ SOURCE PATCHES APPLIED CLEANLY ===")
