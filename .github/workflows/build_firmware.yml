@@ -1,0 +1,39 @@
+name: Build Chico Clean Firmware (ESP32-S3)
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'patch_chico_source.py'
+      - '.github/workflows/build_firmware.yml'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.4
+    steps:
+      - name: Checkout Chico repo
+        uses: actions/checkout@v4
+      - name: Clone official xiaozhi-esp32
+        run: |
+          git clone --depth 1 https://github.com/78/xiaozhi-esp32.git xiaozhi-esp32
+      - name: Apply clean Chico C++ patches
+        env:
+          CHICO_OTA_URL: "https://chico-nieves.onrender.com/ota/"
+        run: |
+          python3 patch_chico_source.py
+      - name: Configure and Build ESP32-S3 Firmware
+        run: |
+          cd xiaozhi-esp32
+          idf.py set-target esp32s3
+          cat sdkconfig.defaults.chico >> sdkconfig.defaults
+          rm -f sdkconfig
+          idf.py reconfigure
+          idf.py build
+          esptool.py --chip esp32s3 merge_bin -o ../chico-nieves-merged.bin --flash_mode dio --flash_size 16MB @build/flash_args
+      - name: Upload Chico Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chico-nieves-firmware
+          path: |
+            chico-nieves-merged.bin
+            xiaozhi-esp32/build/xiaozhi.bin
