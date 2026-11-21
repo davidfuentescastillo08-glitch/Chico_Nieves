@@ -29,10 +29,22 @@ SYSTEM_PROMPT = (
     "Eres un pequeño robot de escritorio inteligente, cariñoso, simpático y leal para Nieves. "
     "Hablas en español de España de forma concisa, divertida y natural. "
     "Da respuestas breves (máximo 1 o 2 frases cortas) para que suenen ágiles al hablar. "
-    "REGLA CRÍTICA: NUNCA pronuncies la palabra 'Chico' en ninguna respuesta. "
+    "REGLA CRÍTICA: NUNCA pronuncies la palabra 'Chico' ni 'Troko' en ninguna respuesta. "
     "Si te preguntan quién eres, di 'Soy tu compañero de escritorio'. "
     "Nunca uses formato markdown ni listas."
 )
+
+# --- Paleta exacta de temporizador.pyw ---
+BG_RGB = (11, 13, 18)          # #0B0D12
+TRACK_RGB = (26, 32, 48)       # #1A2030
+TICK_IDLE_RGB = (37, 45, 64)   # #252D40
+TEXT_PRIMARY = (243, 246, 252) # #F3F6FC
+TEXT_SECONDARY = (122, 132, 155)
+COLOR_FULL = (94, 234, 212)    # Turquesa menta (#5EEAD4)
+COLOR_MID = (129, 140, 248)    # Índigo suave (#818CF8)
+COLOR_LOW = (251, 191, 36)     # Ámbar (#FBBF24)
+COLOR_CRIT = (251, 113, 133)   # Coral (#FB7185)
+COLOR_DONE = (52, 211, 153)    # Esmeralda (#34D399)
 
 chat_history = []
 active_chico_ws = None
@@ -58,19 +70,46 @@ _NUM_WORDS = {
 }
 
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def _lerp_rgb(c1, c2, t: float):
+    t = _clamp(t, 0.0, 1.0)
+    return (
+        int(round(c1[0] + (c2[0] - c1[0]) * t)),
+        int(round(c1[1] + (c2[1] - c1[1]) * t)),
+        int(round(c1[2] + (c2[2] - c1[2]) * t)),
+    )
+
+
+def _blend_bg(rgb, alpha: float):
+    return _lerp_rgb(BG_RGB, rgb, alpha)
+
+
+def _accent_for_progress(progress: float, remaining_sec: float):
+    if remaining_sec <= 0:
+        return COLOR_DONE
+    if remaining_sec <= 10.0 and progress < 0.5:
+        return _lerp_rgb(COLOR_CRIT, COLOR_LOW, _clamp(remaining_sec / 10.0, 0.0, 1.0))
+    if progress >= 0.5:
+        return _lerp_rgb(COLOR_MID, COLOR_FULL, (progress - 0.5) / 0.5)
+    return _lerp_rgb(COLOR_LOW, COLOR_MID, progress / 0.5)
+
+
 def _load_fonts():
     global _FONT_BIG, _FONT_SMALL, _FONT_TINY
     if _FONT_BIG is not None:
         return
     for fpath in [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        r"C:\Windows\Fonts\segoeuil.ttf",
         r"C:\Windows\Fonts\arialbd.ttf",
-        r"C:\Windows\Fonts\seguisb.ttf",
     ]:
         if os.path.exists(fpath):
-            _FONT_BIG = ImageFont.truetype(fpath, 108)
-            _FONT_SMALL = ImageFont.truetype(fpath, 38)
-            _FONT_TINY = ImageFont.truetype(fpath, 26)
+            _FONT_BIG = ImageFont.truetype(fpath, 98)
+            _FONT_SMALL = ImageFont.truetype(fpath, 32)
+            _FONT_TINY = ImageFont.truetype(fpath, 22)
             return
     _FONT_BIG = ImageFont.load_default()
     _FONT_SMALL = ImageFont.load_default()
@@ -78,70 +117,85 @@ def _load_fonts():
 
 
 def render_timer_frame_jpeg(remaining_sec: int, total_sec: int, label: str) -> bytes:
-    """Renders a crisp 240x240 supersampled circular timer with smooth ring & rounded caps."""
+    """Clones the exact minimalist animated timer from temporizador.pyw at 240x240."""
     _load_fonts()
-    S = 480  # 2x supersampling for buttery smooth anti-aliased edges
-    img = Image.new("RGB", (S, S), (0, 0, 0))
+    S = 480  # 2x supersampling for crisp anti-aliased lines
+    img = Image.new("RGB", (S, S), BG_RGB)
     draw = ImageDraw.Draw(img)
 
-    elapsed = max(0, total_sec - remaining_sec)
-    progress = min(1.0, elapsed / max(1, total_sec))
+    # Progress = remaining fraction (1.0 -> 0.0), matching temporizador.pyw
+    progress = _clamp(remaining_sec / max(1, total_sec), 0.0, 1.0)
+    accent = _accent_for_progress(progress, float(remaining_sec))
 
-    # Accent color: vibrant cyan normally, warm coral in final 10s
-    urgent = (total_sec >= 15 and remaining_sec <= 10) or remaining_sec == 0
-    accent = (255, 92, 96) if urgent else (0, 212, 255)
-    track = (24, 38, 56)
-
-    margin = 30
-    ring_w = 30
-    box = [margin, margin, S - margin, S - margin]
     cx, cy = S / 2.0, S / 2.0
-    radius = (S / 2.0) - margin - (ring_w / 2.0)
+    radius = 178.0
 
-    # Background ring track
-    draw.arc(box, start=0, end=360, fill=track, width=ring_w)
+    # 1. 60 radial watch-like ticks around the ring
+    active_ticks = int(round(progress * 60))
+    for i in range(60):
+        ang = math.radians(-90 + i * 6)
+        is_major = (i % 5 == 0)
+        r_outer = radius + 28.0
+        r_inner = radius + (14.0 if is_major else 20.0)
+        x1 = cx + r_inner * math.cos(ang)
+        y1 = cy + r_inner * math.sin(ang)
+        x2 = cx + r_outer * math.cos(ang)
+        y2 = cy + r_outer * math.sin(ang)
+        if i < active_ticks:
+            tick_col = _blend_bg(accent, 0.65 if is_major else 0.35)
+        else:
+            tick_col = TICK_IDLE_RGB
+        draw.line([(x1, y1), (x2, y2)], fill=tick_col, width=4 if is_major else 2)
 
-    # Progress arc filling clockwise from 12 o'clock (-90 deg)
+    # 2. Background track ring
+    box = [cx - radius, cy - radius, cx + radius, cy + radius]
+    draw.arc(box, start=0, end=360, fill=TRACK_RGB, width=16)
+
+    # 3. Soft glow halo + main progress arc
     if progress > 0.002:
-        end_deg = -90.0 + (360.0 * progress)
-        draw.arc(box, start=-90, end=end_deg, fill=accent, width=ring_w)
+        sweep = 360.0 * min(progress, 0.9999)
+        end_deg = -90.0 + sweep
+        for glow_w, glow_alpha in ((40, 0.09), (28, 0.18), (20, 0.30)):
+            gbox = [cx - radius - (glow_w - 14) / 2, cy - radius - (glow_w - 14) / 2,
+                    cx + radius + (glow_w - 14) / 2, cy + radius + (glow_w - 14) / 2]
+            draw.arc(gbox, start=-90, end=end_deg, fill=_blend_bg(accent, glow_alpha), width=glow_w)
 
-        # Smooth rounded end-caps at start (-90 deg) and leading edge (end_deg)
-        cap_r = ring_w / 2.0
-        for deg in (-90.0, end_deg):
-            rad = math.radians(deg)
-            px = cx + radius * math.cos(rad)
-            py = cy + radius * math.sin(rad)
-            draw.ellipse([px - cap_r, py - cap_r, px + cap_r, py + cap_r], fill=accent)
+        draw.arc(box, start=-90, end=end_deg, fill=accent, width=14)
 
-        # Subtle bright highlight dot on the leading tip
+        # Rounded start cap
+        cap_r = 7.0
+        sx, sy = cx, cy - radius
+        draw.ellipse([sx - cap_r, sy - cap_r, sx + cap_r, sy + cap_r], fill=accent)
+
+        # Luminous tip dot (matching temporizador.pyw)
         rad = math.radians(end_deg)
-        px = cx + radius * math.cos(rad)
-        py = cy + radius * math.sin(rad)
-        dot_r = cap_r * 0.45
-        draw.ellipse([px - dot_r, py - dot_r, px + dot_r, py + dot_r], fill=(235, 252, 255))
+        tx = cx + radius * math.cos(rad)
+        ty = cy + radius * math.sin(rad)
+        draw.ellipse([tx - 18, ty - 18, tx + 18, ty + 18], fill=_blend_bg(accent, 0.28))
+        draw.ellipse([tx - 10, ty - 10, tx + 10, ty + 10], fill=TEXT_PRIMARY, outline=accent, width=3)
 
-    # Top subtle status label
-    top_txt = "¡LISTO!" if remaining_sec == 0 else "FALTAN"
-    tb = draw.textbbox((0, 0), top_txt, font=_FONT_TINY)
-    draw.text(((S - (tb[2] - tb[0])) / 2, 118), top_txt, fill=(130, 155, 180), font=_FONT_TINY)
-
-    # Big center countdown MM:SS or H:MM:SS
+    # 4. Center countdown MM:SS or H:MM:SS
     h, rem = divmod(max(0, int(remaining_sec)), 3600)
     m, s = divmod(rem, 60)
     time_str = f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
     bb = draw.textbbox((0, 0), time_str, font=_FONT_BIG)
     tw, th = bb[2] - bb[0], bb[3] - bb[1]
-    draw.text(((S - tw) / 2, (S - th) / 2 - 22), time_str, fill=(255, 255, 255), font=_FONT_BIG)
+    draw.text(((S - tw) / 2, cy - th / 2 - 22), time_str, fill=TEXT_PRIMARY, font=_FONT_BIG)
 
-    # Bottom timer label
-    clean_lbl = label.strip().upper()[:14] if label and label.lower() not in ("temporizador", "timer", "") else "TEMPORIZADOR"
-    lb = draw.textbbox((0, 0), clean_lbl, font=_FONT_SMALL)
-    draw.text(((S - (lb[2] - lb[0])) / 2, 314), clean_lbl, fill=accent, font=_FONT_SMALL)
+    # 5. Subtitle / label below time
+    if remaining_sec <= 0:
+        sub_txt = "COMPLETADO"
+    elif label and label.lower() not in ("temporizador", "timer", ""):
+        sub_txt = label.strip().upper()[:14]
+    else:
+        sub_txt = "EN CURSO"
+    lb = draw.textbbox((0, 0), sub_txt, font=_FONT_SMALL)
+    draw.text(((S - (lb[2] - lb[0])) / 2, cy + 54), sub_txt, fill=accent, font=_FONT_SMALL)
 
     final_img = img.resize((240, 240), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    final_img.save(buf, format="JPEG", quality=82, optimize=True)
+    # Baseline non-progressive JPEG (optimize=False, subsampling=0) for 100% ESP32 LVGL tjpgd compatibility
+    final_img.save(buf, format="JPEG", quality=80, optimize=False, progressive=False, subsampling=0)
     return buf.getvalue()
 
 
@@ -151,7 +205,7 @@ def next_mcp_id() -> int:
     return mcp_call_seq
 
 
-async def send_mcp_to_chico(tool_name: str, arguments: dict, wait_response: bool = False, timeout: float = 2.5):
+async def send_mcp_to_chico(tool_name: str, arguments: dict, wait_response: bool = False, timeout: float = 3.0):
     global active_chico_ws
     if not active_chico_ws or active_chico_ws.closed:
         return None
@@ -230,32 +284,24 @@ def _fmt_duration(sec: int) -> str:
     return " y ".join(parts)
 
 
-def generate_alarm_beep_opus_packets(duration_sec: float = 2.0):
-    """Pleasant 2-second double-beep alarm chime encoded as 60ms Opus frames."""
+def generate_alarm_beep_opus_packets():
+    """Exact 3-note chime from temporizador.pyw (C5-E5-G5: 523/659/784 Hz) played twice smoothly."""
     sr = 16000
-    total_samples = int(sr * duration_sec)
-    pcm = np.zeros(total_samples, dtype=np.float32)
-
-    cycle_len = int(sr * 0.5)
-    t_tone = np.arange(int(sr * 0.14), dtype=np.float32) / sr
-    fade = int(sr * 0.01)
-    env = np.ones_like(t_tone)
-    env[:fade] = np.linspace(0, 1, fade)
-    env[-fade:] = np.linspace(1, 0, fade)
-
-    beep1 = np.sin(2 * np.pi * 880.0 * t_tone) * env * 13000.0
-    beep2 = np.sin(2 * np.pi * 1174.66 * t_tone) * env * 13000.0
-
-    for c in range(int(duration_sec / 0.5)):
-        base = c * cycle_len
-        end1 = min(base + len(beep1), total_samples)
-        pcm[base:end1] = beep1[:end1 - base]
-        start2 = base + int(sr * 0.18)
-        end2 = min(start2 + len(beep2), total_samples)
-        if start2 < total_samples:
-            pcm[start2:end2] = beep2[:end2 - start2]
-
-    return _encode_pcm_to_opus(pcm.astype(np.int16))
+    segments = []
+    for _repeat in range(2):
+        for freq, dur_ms in ((523.25, 130), (659.25, 130), (783.99, 260)):
+            n = int(sr * dur_ms / 1000.0)
+            t = np.arange(n, dtype=np.float32) / sr
+            fade = min(int(sr * 0.015), n // 3)
+            env = np.ones(n, dtype=np.float32)
+            env[:fade] = np.linspace(0.0, 1.0, fade)
+            env[-fade:] = np.linspace(1.0, 0.0, fade)
+            tone = (np.sin(2 * np.pi * freq * t) + 0.25 * np.sin(2 * np.pi * freq * 2 * t)) * env * 11000.0
+            segments.append(tone)
+            segments.append(np.zeros(int(sr * 0.045), dtype=np.float32))
+        segments.append(np.zeros(int(sr * 0.20), dtype=np.float32))
+    full_pcm = np.concatenate(segments).astype(np.int16)
+    return _encode_pcm_to_opus(full_pcm)
 
 
 def _encode_pcm_to_opus(full_pcm: np.ndarray):
@@ -310,7 +356,7 @@ async def notify_chico(text: str, with_beep: bool = False):
         return
     opus_packets = []
     if with_beep:
-        opus_packets.extend(generate_alarm_beep_opus_packets(2.0))
+        opus_packets.extend(generate_alarm_beep_opus_packets())
     speech_packets = await generate_speech_opus_packets(text)
     if not speech_packets:
         return
@@ -326,9 +372,6 @@ async def notify_chico(text: str, with_beep: bool = False):
         await active_chico_ws.send_str(json.dumps({"type": "tts", "state": "sentence_end"}))
         await active_chico_ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
         logger.info(f"Notification played: '{text}'")
-        if not active_timers:
-            await asyncio.sleep(0.25)
-            await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
     except Exception as e:
         logger.error(f"Error streaming notification: {e}")
 
@@ -342,8 +385,8 @@ def add_timer(duration_seconds: int, label: str) -> int:
     async def timer_worker():
         global current_timer_jpeg
         try:
-            # Small initial delay so the confirmation TTS starts smoothly first
-            await asyncio.sleep(0.25)
+            # Wait briefly so confirmation TTS finishes streaming cleanly without competing for bandwidth
+            await asyncio.sleep(0.3)
             last_shown = -1
             while True:
                 now = time.time()
@@ -354,17 +397,18 @@ def add_timer(duration_seconds: int, label: str) -> int:
                     last_shown = rem_int
                     current_timer_jpeg = render_timer_frame_jpeg(rem_int, duration_seconds, label)
                     img_url = f"{public_base_url}/timer.jpg?id={t_id}&r={rem_int}&ts={int(now * 1000)}"
-                    await send_mcp_to_chico(
+                    resp = await send_mcp_to_chico(
                         "self.screen.preview_image",
                         {preview_param_name: img_url},
                         wait_response=True,
-                        timeout=2.5,
+                        timeout=3.5,
                     )
+                    if resp is not None:
+                        logger.info(f"preview_image resp (r={rem_int}): {resp}")
 
                 if rem_float <= 0:
                     break
 
-                # Sleep until the next whole-second tick
                 next_boundary = end_time - (rem_int - 1)
                 sleep_dur = max(0.05, min(1.0, next_boundary - time.time()))
                 await asyncio.sleep(sleep_dur)
@@ -372,8 +416,8 @@ def add_timer(duration_seconds: int, label: str) -> int:
             if t_id in active_timers:
                 del active_timers[t_id]
 
-            logger.info(f"Timer #{t_id} ('{label}') expired -> returning to eyes + 2s beep + voice")
-            await asyncio.sleep(0.25)
+            logger.info(f"Timer #{t_id} ('{label}') expired -> eyes + chime + voice")
+            await asyncio.sleep(0.35)
             await send_mcp_to_chico("self.screen.clear_preview", {}, wait_response=True, timeout=1.5)
             await asyncio.sleep(0.15)
             para = "" if label.lower() in ("temporizador", "timer", "") else f" de {label}"
@@ -441,7 +485,7 @@ def transcribe_audio_groq(wav_bytes: bytes) -> str:
     data = {
         "model": GROQ_STT_MODEL,
         "language": "es",
-        "prompt": "Chico, temporizador, alarma, recordatorio, minutos, segundos, pizza, Nieves.",
+        "prompt": "Troko, Chico, temporizador, alarma, recordatorio, minutos, segundos, pizza, Nieves.",
     }
     try:
         resp = requests.post(url, headers=headers, files=files, data=data, timeout=8)
@@ -470,19 +514,27 @@ def query_groq_llm(user_text: str) -> str:
         "User-Agent": "ChicoClient/1.0",
     }
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + chat_history[-6:] + [{"role": "user", "content": user_text}]
-    data = {"model": GROQ_LLM_MODEL, "messages": messages, "max_tokens": 120, "temperature": 0.7}
+    data = {
+        "model": GROQ_LLM_MODEL,
+        "messages": messages,
+        "max_tokens": 120,
+        "temperature": 0.7,
+        "reasoning_effort": "none",
+    }
     try:
         resp = requests.post(url, headers=headers, json=data, timeout=8)
         if resp.status_code == 200:
             answer = (resp.json()["choices"][0]["message"].get("content") or "").strip()
             answer = answer.replace("*", "").replace("#", "").strip()
             answer = re.sub(r"\b[Cc]hico\b", "tu robot", answer)
-            answer = re.sub(r"\b[Cc]hicos\b", "amigos", answer)
-            chat_history.append({"role": "user", "content": user_text})
-            chat_history.append({"role": "assistant", "content": answer})
-            del chat_history[:-12]
-            return answer
-        logger.error(f"Groq LLM error {resp.status_code}: {resp.text[:200]}")
+            answer = re.sub(r"\b[Tt]roko\b", "tu robot", answer)
+            if answer:
+                chat_history.append({"role": "user", "content": user_text})
+                chat_history.append({"role": "assistant", "content": answer})
+                del chat_history[:-12]
+                return answer
+        else:
+            logger.error(f"Groq LLM error {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         logger.error(f"Groq LLM exception: {e}")
     return "Perdona, no te he entendido bien. ¿Me lo repites?"
@@ -503,7 +555,7 @@ async def handle_ota(request):
 async def handle_timer_image(request):
     global current_timer_jpeg
     if not current_timer_jpeg:
-        current_timer_jpeg = render_timer_frame_jpeg(0, 1, "TEMPORIZADOR")
+        current_timer_jpeg = render_timer_frame_jpeg(15, 15, "TEMPORIZADOR")
     return web.Response(
         body=current_timer_jpeg,
         content_type="image/jpeg",
@@ -513,7 +565,7 @@ async def handle_timer_image(request):
 
 async def handle_root(request):
     return web.Response(
-        text="<h1>Chico Cloud Server 24/7 activo para Nieves!</h1><p>Troko Visual Timers + Groq Whisper + Qwen + Edge-TTS Alvaro.</p>",
+        text="<h1>Chico Cloud Server 24/7 activo para Nieves!</h1><p>Temporizador minimalista + Groq Instant + Edge-TTS Alvaro.</p>",
         content_type="text/html",
     )
 
@@ -537,7 +589,20 @@ async def handle_websocket(request):
         "audio_params": {"format": "opus", "sample_rate": 16000, "channels": 1, "frame_duration": 60},
     }))
 
-    # Query MCP tools (including user tools) to auto-confirm preview_image parameter name
+    # Proper MCP handshake: initialize -> tools/list
+    await ws.send_str(json.dumps({
+        "type": "mcp",
+        "payload": {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "chico-server", "version": "1.0.0"},
+            },
+        },
+    }))
     await ws.send_str(json.dumps({
         "type": "mcp",
         "payload": {
@@ -559,7 +624,7 @@ async def handle_websocket(request):
     total_listen_frames = 0
     speech_frames_count = 0
     silence_frames_after_speech = 0
-    SPEECH_THRESHOLD = 500
+    SPEECH_THRESHOLD = 220
 
     async def finish_and_reply():
         nonlocal listening, is_processing, is_playing_tts, incoming_pcm
@@ -571,7 +636,7 @@ async def handle_websocket(request):
 
         frames_to_process = list(incoming_pcm)
         incoming_pcm = []
-        if len(frames_to_process) < 6:
+        if len(frames_to_process) < 5:
             is_processing = False
             return
 
@@ -590,7 +655,7 @@ async def handle_websocket(request):
 
         cleaned_lower = user_text.lower().strip()
         noise_phrases = ["suscríbete", "subtítulo", "subtitul", "amara.org", "gracias por ver", "canal"]
-        exact_noise = {"gracias", "gracias.", "¡gracias!", "y", "si", "sí", "ah", "eh", "mm", "mmm", "vale", "ok"}
+        exact_noise = {"gracias", "gracias.", "¡gracias!", "y", "si", "sí", "ah", "eh", "mm", "mmm", "vale", "ok", "troko", "troko."}
         if not user_text or len(cleaned_lower) < 3 or cleaned_lower in exact_noise or any(p in cleaned_lower for p in noise_phrases):
             logger.info(f"Ignoring noise ('{user_text}'). Returning to Idle.")
             await ws.send_str(json.dumps({"type": "tts", "state": "start"}))
@@ -598,9 +663,6 @@ async def handle_websocket(request):
             await ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
             is_processing = False
             total_listen_frames = speech_frames_count = silence_frames_after_speech = 0
-            if not active_timers:
-                await asyncio.sleep(0.15)
-                await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
             return
 
         reply_text = await loop.run_in_executor(None, query_groq_llm, user_text)
@@ -620,9 +682,6 @@ async def handle_websocket(request):
                 await asyncio.sleep(0.055)
             await ws.send_str(json.dumps({"type": "tts", "state": "sentence_end"}))
             await ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
-            if not active_timers:
-                await asyncio.sleep(0.2)
-                await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
         except Exception as e:
             logger.warning(f"TTS stream error: {e}")
         finally:
@@ -640,6 +699,7 @@ async def handle_websocket(request):
                 if msg_type == "mcp":
                     payload = data.get("payload", {})
                     resp_id = payload.get("id")
+                    logger.info(f"MCP response [id={resp_id}]: {str(payload)[:260]}")
                     if resp_id in pending_mcp_calls and not pending_mcp_calls[resp_id].done():
                         pending_mcp_calls[resp_id].set_result(payload)
                     elif resp_id == 1 and "result" in payload:
@@ -674,15 +734,15 @@ async def handle_websocket(request):
                             total_listen_frames += 1
                             rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
                             max_val = int(np.max(np.abs(arr)))
-                            if rms > SPEECH_THRESHOLD or max_val > 700:
+                            if rms > SPEECH_THRESHOLD or max_val > 400:
                                 speech_frames_count += 1
                                 silence_frames_after_speech = 0
                             elif speech_frames_count >= 3:
                                 silence_frames_after_speech += 1
 
-                    if speech_frames_count >= 4 and silence_frames_after_speech >= 10:
+                    if speech_frames_count >= 4 and silence_frames_after_speech >= 7:
                         asyncio.create_task(finish_and_reply())
-                    elif total_listen_frames >= 60:
+                    elif total_listen_frames >= 80:
                         asyncio.create_task(finish_and_reply())
                 except Exception:
                     pass
