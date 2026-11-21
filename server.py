@@ -56,6 +56,13 @@ pending_mcp_calls = {}
 preview_param_name = "url"
 public_base_url = "https://chico-nieves.onrender.com"
 current_timer_jpeg = b""
+recent_debug = []
+
+
+def dbg(msg: str):
+    logger.info(msg)
+    recent_debug.append(f"{time.strftime('%H:%M:%S')} {msg}")
+    del recent_debug[:-30]
 
 _FONT_BIG = None
 _FONT_SMALL = None
@@ -371,7 +378,10 @@ async def notify_chico(text: str, with_beep: bool = False):
             await asyncio.sleep(0.055)
         await active_chico_ws.send_str(json.dumps({"type": "tts", "state": "sentence_end"}))
         await active_chico_ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
-        logger.info(f"Notification played: '{text}'")
+        dbg(f"Notification played: '{text}'")
+        if not active_timers:
+            await asyncio.sleep(0.25)
+            await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
     except Exception as e:
         logger.error(f"Error streaming notification: {e}")
 
@@ -563,9 +573,22 @@ async def handle_timer_image(request):
     )
 
 
+async def handle_debug(request):
+    return web.Response(text="\n".join(recent_debug) or "(no logs yet)", content_type="text/plain")
+
+
+async def handle_test_preview(request):
+    global current_timer_jpeg
+    current_timer_jpeg = render_timer_frame_jpeg(42, 60, "pizza")
+    img_url = f"{public_base_url}/timer.jpg?test={int(time.time() * 1000)}"
+    resp = await send_mcp_to_chico("self.screen.preview_image", {preview_param_name: img_url}, wait_response=True, timeout=5.0)
+    dbg(f"TEST preview_image({img_url}) -> {resp}")
+    return web.json_response({"url": img_url, "resp": resp, "ws_connected": bool(active_chico_ws and not active_chico_ws.closed)})
+
+
 async def handle_root(request):
     return web.Response(
-        text="<h1>Chico Cloud Server 24/7 activo para Nieves!</h1><p>Temporizador minimalista + Groq Instant + Edge-TTS Alvaro.</p>",
+        text="<h1>Chico Cloud Server 24/7 activo para Nieves!</h1><p>Temporizador minimalista v2 + Groq Instant + Edge-TTS Alvaro.</p>",
         content_type="text/html",
     )
 
@@ -624,7 +647,7 @@ async def handle_websocket(request):
     total_listen_frames = 0
     speech_frames_count = 0
     silence_frames_after_speech = 0
-    SPEECH_THRESHOLD = 220
+    SPEECH_THRESHOLD = 420
 
     async def finish_and_reply():
         nonlocal listening, is_processing, is_playing_tts, incoming_pcm
@@ -657,16 +680,19 @@ async def handle_websocket(request):
         noise_phrases = ["suscríbete", "subtítulo", "subtitul", "amara.org", "gracias por ver", "canal"]
         exact_noise = {"gracias", "gracias.", "¡gracias!", "y", "si", "sí", "ah", "eh", "mm", "mmm", "vale", "ok", "troko", "troko."}
         if not user_text or len(cleaned_lower) < 3 or cleaned_lower in exact_noise or any(p in cleaned_lower for p in noise_phrases):
-            logger.info(f"Ignoring noise ('{user_text}'). Returning to Idle.")
+            dbg(f"Ignoring noise ('{user_text}'). Returning to Idle.")
             await ws.send_str(json.dumps({"type": "tts", "state": "start"}))
             await asyncio.sleep(0.05)
             await ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
             is_processing = False
             total_listen_frames = speech_frames_count = silence_frames_after_speech = 0
+            if not active_timers:
+                await asyncio.sleep(0.2)
+                await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
             return
 
         reply_text = await loop.run_in_executor(None, query_groq_llm, user_text)
-        logger.info(f"Chico reply: '{reply_text}'")
+        dbg(f"User: '{user_text}' -> Reply: '{reply_text}'")
         opus_packets = await generate_speech_opus_packets(reply_text)
 
         is_playing_tts = True
@@ -682,6 +708,9 @@ async def handle_websocket(request):
                 await asyncio.sleep(0.055)
             await ws.send_str(json.dumps({"type": "tts", "state": "sentence_end"}))
             await ws.send_str(json.dumps({"type": "tts", "state": "stop"}))
+            if not active_timers:
+                await asyncio.sleep(0.25)
+                await send_mcp_to_chico("self.audio.enter_wake_only_mode", {})
         except Exception as e:
             logger.warning(f"TTS stream error: {e}")
         finally:
@@ -699,7 +728,7 @@ async def handle_websocket(request):
                 if msg_type == "mcp":
                     payload = data.get("payload", {})
                     resp_id = payload.get("id")
-                    logger.info(f"MCP response [id={resp_id}]: {str(payload)[:260]}")
+                    dbg(f"MCP resp [id={resp_id}]: {str(payload)[:260]}")
                     if resp_id in pending_mcp_calls and not pending_mcp_calls[resp_id].done():
                         pending_mcp_calls[resp_id].set_result(payload)
                     elif resp_id == 1 and "result" in payload:
@@ -734,7 +763,7 @@ async def handle_websocket(request):
                             total_listen_frames += 1
                             rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
                             max_val = int(np.max(np.abs(arr)))
-                            if rms > SPEECH_THRESHOLD or max_val > 400:
+                            if rms > SPEECH_THRESHOLD or max_val > 650:
                                 speech_frames_count += 1
                                 silence_frames_after_speech = 0
                             elif speech_frames_count >= 3:
@@ -759,6 +788,8 @@ async def handle_websocket(request):
 def main():
     app = web.Application()
     app.router.add_get("/", handle_root)
+    app.router.add_get("/debug", handle_debug)
+    app.router.add_get("/test_preview", handle_test_preview)
     app.router.add_get("/o", handle_ota)
     app.router.add_post("/o", handle_ota)
     app.router.add_get("/ota/", handle_ota)
