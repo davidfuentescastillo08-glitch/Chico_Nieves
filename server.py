@@ -201,8 +201,8 @@ def render_timer_frame_jpeg(remaining_sec: int, total_sec: int, label: str) -> b
 
     final_img = img.resize((240, 240), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    # Baseline non-progressive JPEG (optimize=False, subsampling=0) for 100% ESP32 LVGL tjpgd compatibility
-    final_img.save(buf, format="JPEG", quality=80, optimize=False, progressive=False, subsampling=0)
+    # Troko v2.5.3 LVGL has LODEPNG enabled (no TJPGD/JPEG decoder), so serve crisp lossless PNG!
+    final_img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
 
@@ -406,7 +406,7 @@ def add_timer(duration_seconds: int, label: str) -> int:
                 if rem_int != last_shown:
                     last_shown = rem_int
                     current_timer_jpeg = render_timer_frame_jpeg(rem_int, duration_seconds, label)
-                    img_url = f"{public_base_url}/timer.jpg?id={t_id}&r={rem_int}&ts={int(now * 1000)}"
+                    img_url = f"{public_base_url}/timer.png?id={t_id}&r={rem_int}&ts={int(now * 1000)}"
                     resp = await send_mcp_to_chico(
                         "self.screen.preview_image",
                         {preview_param_name: img_url},
@@ -568,7 +568,7 @@ async def handle_timer_image(request):
         current_timer_jpeg = render_timer_frame_jpeg(15, 15, "TEMPORIZADOR")
     return web.Response(
         body=current_timer_jpeg,
-        content_type="image/jpeg",
+        content_type="image/png",
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
 
@@ -580,7 +580,7 @@ async def handle_debug(request):
 async def handle_test_preview(request):
     global current_timer_jpeg
     current_timer_jpeg = render_timer_frame_jpeg(42, 60, "pizza")
-    img_url = f"{public_base_url}/timer.jpg?test={int(time.time() * 1000)}"
+    img_url = f"{public_base_url}/timer.png?test={int(time.time() * 1000)}"
     resp = await send_mcp_to_chico("self.screen.preview_image", {preview_param_name: img_url}, wait_response=True, timeout=5.0)
     dbg(f"TEST preview_image({img_url}) -> {resp}")
     return web.json_response({"url": img_url, "resp": resp, "ws_connected": bool(active_chico_ws and not active_chico_ws.closed)})
@@ -588,7 +588,7 @@ async def handle_test_preview(request):
 
 async def handle_root(request):
     return web.Response(
-        text="<h1>Chico Cloud Server 24/7 activo para Nieves!</h1><p>Temporizador minimalista v2 + Groq Instant + Edge-TTS Alvaro.</p>",
+        text="<h1>Chico Cloud Server 24/7 activo para Nieves!</h1><p>Temporizador minimalista PNG v3 + Groq Instant + Edge-TTS Alvaro.</p>",
         content_type="text/html",
     )
 
@@ -794,6 +794,7 @@ def main():
     app.router.add_post("/o", handle_ota)
     app.router.add_get("/ota/", handle_ota)
     app.router.add_post("/ota/", handle_ota)
+    app.router.add_get("/timer.png", handle_timer_image)
     app.router.add_get("/timer.jpg", handle_timer_image)
     app.router.add_get("/ws", handle_websocket)
     logger.info(f"CHICO CLOUD SERVER 24/7 INICIADO EN 0.0.0.0:{PORT}")
